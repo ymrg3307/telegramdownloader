@@ -16,7 +16,7 @@ from tqdm import tqdm
 # Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.WARNING  # Changed from INFO to WARNING to reduce logs
 )
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,9 @@ class TelegramDownloader:
         # Download counter
         self.downloaded_count = 0
         self.failed_count = 0
+        
+        # Track failed downloads for retry
+        self.failed_messages = []
         
     async def connect(self):
         """Connect to Telegram"""
@@ -174,13 +177,10 @@ class TelegramDownloader:
                 mime_type = None
                 file_name = None
                 
-                # Debug info
-                print(f"Message ID: {message.id}, Media type: {type(message.media).__name__}")
-                
+                # Minimal info
                 if isinstance(message.media, MessageMediaDocument):
                     doc = message.media.document
                     mime_type = doc.mime_type
-                    print(f"MIME type: {mime_type}")
                     
                     # Check if it's a video based on mime type
                     if mime_type.startswith('video/'):
@@ -193,39 +193,32 @@ class TelegramDownloader:
                             file_ext = os.path.splitext(file_name)[1].lower()[1:]
                             if not file_type:  # Only set if not already determined by mime type
                                 file_type = file_ext
-                            print(f"Found file name: {file_name}, extension: {file_ext}")
                             break
                     
                     # If no file name found but we have mime type, use that to determine extension
                     if not file_name and mime_type:
                         ext = mime_type.split('/')[1] if '/' in mime_type else 'unknown'
                         file_type = ext
-                        print(f"No filename found, using mime type to determine extension: {ext}")
+                        # Using mime type to determine extension
                 
                 elif isinstance(message.media, MessageMediaPhoto):
                     file_type = "photo"
-                    print("Media is a photo")
                 
-                # Debug output for file type detection
-                print(f"Detected file type: {file_type}")
-                print(f"User requested file types: {self.file_types}")
+                # Simplified output
+                if self.file_types:
+                    print(f"File type: {file_type}, Requested types: {', '.join(self.file_types)}")
                 
                 # Check if we want to download this file type
                 should_download = False
                 if not self.file_types:  # Download all types if no filter
                     should_download = True
-                    print("No file type filter, downloading all types")
                 elif file_type:
                     # Check if the file type matches any of the requested types
                     if file_type in self.file_types:
                         should_download = True
-                        print(f"File type {file_type} matches requested type")
                     # Special case for video: check mime type as well
                     elif 'video' in self.file_types and mime_type and mime_type.startswith('video/'):
                         should_download = True
-                        print(f"MIME type {mime_type} matches requested video type")
-                    else:
-                        print(f"File type {file_type} does not match any requested type")
                 
                 if should_download:
                     # Generate a unique filename
@@ -282,11 +275,13 @@ class TelegramDownloader:
             logger.error(f"Error downloading file: {e}")
             print(f"Error downloading file: {e}")
             self.failed_count += 1
+            # Track failed message for retry
+            self.failed_messages.append(message)
         
         return False
     
-    async def download_from_channel(self, channel_input: str, limit: Optional[int] = None):
-        """Download files from a channel"""
+    async def download_from_channel(self, channel_input: str, limit: Optional[int] = None, batch_size: int = 10):
+        """Download files from a channel in batches"""
         entity = await self.get_entity(channel_input)
         if not entity:
             print(f"Could not find channel: {channel_input}")
@@ -301,13 +296,30 @@ class TelegramDownloader:
         media_messages = [msg for msg in messages if msg.media]
         print(f"Found {len(media_messages)} messages with media")
         
-        # Download files
-        for message in media_messages:
-            await self.download_file(message)
+        # Process files in batches
+        total_batches = (len(media_messages) + batch_size - 1) // batch_size  # Ceiling division
+        
+        for batch_num in range(total_batches):
+            start_idx = batch_num * batch_size
+            end_idx = min(start_idx + batch_size, len(media_messages))
+            batch = media_messages[start_idx:end_idx]
+            
+            print(f"\nProcessing batch {batch_num + 1}/{total_batches} (files {start_idx + 1}-{end_idx})")
+            
+            # Process batch concurrently
+            download_tasks = [self.download_file(message) for message in batch]
+            await asyncio.gather(*download_tasks)
+            
+            # Print batch summary
+            print(f"Batch {batch_num + 1} complete: {end_idx - start_idx} files processed")
         
         print(f"\nDownload summary:")
         print(f"Successfully downloaded: {self.downloaded_count} files")
         print(f"Failed downloads: {self.failed_count} files")
+        
+        # Offer retry if there are failed downloads
+        if self.failed_messages:
+            print(f"\n{len(self.failed_messages)} files failed to download. You can retry them later using the retry_failed_downloads method.")
     
     def set_file_types(self, file_types: List[str]):
         """Set the file types to download"""
@@ -317,6 +329,156 @@ class TelegramDownloader:
         """Set the download folder"""
         self.download_folder = folder
         os.makedirs(self.download_folder, exist_ok=True)
+    
+    async def download_from_link(self, message_link: str):
+        """Download a video or file from a Telegram message link
+        
+        Args:
+            message_link: A Telegram message link like https://t.me/channel_name/123
+                          or private channel format https://t.me/c/channel_id/message_id
+        
+        Returns:
+            bool: True if download was successful, False otherwise
+        """
+        try:
+            # Parse the link to extract channel name/id and message ID
+            if not ('t.me/' in message_link or 'telegram.me/' in message_link):
+                print(f"Invalid Telegram link format: {message_link}")
+                print("Link should be in format: https://t.me/channel_name/123 or https://t.me/c/channel_id/message_id")
+                return False
+            
+            # Extract channel information and message ID
+            parts = message_link.split('/')
+            if len(parts) < 5:  # Need at least protocol://domain/channel/message_id
+                print(f"Invalid link format: {message_link}")
+                return False
+            
+            # Handle different link formats
+            is_private_channel = False
+            channel_identifier = None
+            message_id = None
+            
+            # Find the t.me or telegram.me part
+            for i, part in enumerate(parts):
+                if part in ['t.me', 'telegram.me'] and i+1 < len(parts):
+                    # Check if it's a private channel format (t.me/c/channel_id/message_id)
+                    if parts[i+1] == 'c' and i+2 < len(parts) and i+3 < len(parts):
+                        is_private_channel = True
+                        channel_identifier = parts[i+2]  # This is the channel ID
+                        if parts[i+3].isdigit():
+                            message_id = int(parts[i+3])
+                    else:
+                        # Regular format (t.me/channel_name/message_id)
+                        channel_identifier = parts[i+1]  # This is the channel name
+                        if i+2 < len(parts) and parts[i+2].isdigit():
+                            message_id = int(parts[i+2])
+                    break
+            
+            if not channel_identifier or not message_id:
+                print(f"Could not extract channel information and message ID from link: {message_link}")
+                return False
+            
+            # For private channels, we need to format the channel ID correctly
+            entity = None
+            if is_private_channel:
+                print(f"Accessing private channel...")
+                # Try to convert channel_identifier to an integer and format it correctly
+                try:
+                    channel_id = int(channel_identifier)
+                    # For private channels, we need to use the -100 prefix format
+                    if not str(channel_id).startswith('-100'):
+                        channel_id = -1000000000000 - channel_id
+                    entity = await self.client.get_entity(channel_id)
+                except Exception:
+                    # Try alternative approach with PeerChannel
+                    try:
+                        from telethon.tl.types import PeerChannel
+                        peer_id = int(channel_identifier)
+                        entity = await self.client.get_entity(PeerChannel(peer_id))
+                    except Exception:
+                        pass
+            else:
+                print(f"Accessing channel...")
+                entity = await self.get_entity(channel_identifier)
+            
+            if not entity:
+                print(f"Could not find channel with identifier: {channel_identifier}")
+                return False
+            
+            # Get the specific message
+            message = await self.client.get_messages(entity, ids=message_id)
+            if not message:
+                print(f"Could not find message with ID {message_id}")
+                return False
+            
+            # Download the file
+            print(f"Found message. Downloading...")
+            result = await self.download_file(message)
+            
+            if result:
+                print(f"Successfully downloaded file from {message_link}")
+            else:
+                print(f"Failed to download file from {message_link}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error downloading from link: {e}")
+            print(f"Error downloading from link: {e}")
+            return False
+        
+    async def retry_failed_downloads(self, max_retries: int = 3):
+        """Retry downloading files that failed previously"""
+        if not self.failed_messages:
+            print("No failed downloads to retry.")
+            return
+            
+        print(f"Retrying {len(self.failed_messages)} failed downloads...")
+        
+        # Make a copy of the failed messages list
+        messages_to_retry = self.failed_messages.copy()
+        self.failed_messages = []  # Clear the list for this retry attempt
+        
+        # Reset failed count for this retry session
+        previous_failed_count = self.failed_count
+        self.failed_count = 0
+        
+        # Retry each failed download with multiple attempts
+        for attempt in range(1, max_retries + 1):
+            if not messages_to_retry:
+                break
+                
+            print(f"\nRetry attempt {attempt}/{max_retries}")
+            
+            # Try to download each failed file
+            retry_tasks = [self.download_file(message) for message in messages_to_retry]
+            results = await asyncio.gather(*retry_tasks)
+            
+            # Filter out successful downloads
+            still_failed = [msg for msg, success in zip(messages_to_retry, results) if not success]
+            
+            # Update counters
+            successful_retries = len(messages_to_retry) - len(still_failed)
+            print(f"Successfully downloaded {successful_retries} files in retry attempt {attempt}")
+            
+            # If all files were downloaded or we've reached max retries, break
+            if not still_failed:
+                print("All files successfully downloaded!")
+                break
+            
+            # Update the list for next retry attempt
+            messages_to_retry = still_failed
+            
+            if attempt < max_retries:
+                print(f"{len(still_failed)} files still failed. Trying again...")
+                # Small delay between retry attempts
+                await asyncio.sleep(2)
+        
+        # Final report
+        print(f"\nRetry summary:")
+        print(f"Previously failed: {previous_failed_count} files")
+        print(f"Successfully retried: {previous_failed_count - self.failed_count} files")
+        print(f"Still failed: {self.failed_count} files")
 
 def extract_channel_info(channel_input: str) -> str:
     """Helper function to extract channel information from various URL formats"""
@@ -348,7 +510,7 @@ def extract_channel_info(channel_input: str) -> str:
     return channel_input
 
 async def main():
-    # Create the downloader
+    # Create downloader instance
     downloader = TelegramDownloader(API_ID, API_HASH)
     
     # Connect to Telegram
@@ -369,6 +531,9 @@ async def main():
     if file_types_input.strip():
         file_types = [ft.strip().lower() for ft in file_types_input.split(',')]
         downloader.set_file_types(file_types)
+        print(f"Will download files of types: {', '.join(file_types)}")
+    else:
+        print("Will download all file types")
     
     # Get download folder
     download_folder = input("\nEnter download folder (default: downloads): ")
@@ -379,9 +544,24 @@ async def main():
     limit_input = input("\nEnter maximum number of messages to scan (default: all): ")
     limit = int(limit_input) if limit_input.strip() else None
     
+    # Get batch size
+    batch_size_input = input("\nEnter batch size for concurrent downloads (default: 10): ")
+    batch_size = int(batch_size_input) if batch_size_input.strip() else 10
+    
     # Download files
     print("\nStarting download...")
-    await downloader.download_from_channel(processed_channel_input, limit)
+    await downloader.download_from_channel(processed_channel_input, limit, batch_size)
+    
+    # Ask if user wants to retry failed downloads
+    if downloader.failed_count > 0:
+        retry_input = input(f"\n{downloader.failed_count} files failed to download. Do you want to retry? (y/n): ")
+        if retry_input.lower() in ['y', 'yes']:
+            max_retries_input = input("Enter maximum number of retry attempts (default: 3): ")
+            max_retries = int(max_retries_input) if max_retries_input.strip() else 3
+            await downloader.retry_failed_downloads(max_retries)
+    
+    # Disconnect
+    await downloader.client.disconnect()
 
 if __name__ == "__main__":
     asyncio.run(main())
